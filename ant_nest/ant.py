@@ -13,6 +13,7 @@ from .pipelines import Pipeline
 from .items import Item
 from .exceptions import Dropped
 from .reporter import Reporter
+from .states import Mode, StateStorage, request_fingerprint
 from . import utils
 
 pwd = os.getcwd()
@@ -36,6 +37,20 @@ class Ant(abc.ABC):
         self.client = httpx.AsyncClient(**settings.HTTPX_CONFIG)
         self.pool = Pool(**settings.POOL_CONFIG)
         self.reporter = Reporter(**settings.REPORTER)
+        self.state_storage: typing.Optional[StateStorage] = None
+        if getattr(settings, "PERSISTENT_STATE", {}).get("enabled", False):
+            persistent_settings = settings.PERSISTENT_STATE
+            self.state_storage = StateStorage(
+                persistent_settings["dir"],
+                mode=persistent_settings.get("mode", Mode.RESUME),
+                checkpoint_interval=persistent_settings.get("checkpoint_interval", 100),
+            )
+            for pipeline in itertools.chain(
+                self.item_pipelines, self.request_pipelines
+            ):
+                bind_storage = getattr(pipeline, "bind_storage", None)
+                if bind_storage is not None:
+                    bind_storage(self.state_storage)
 
     @property
     def name(self):
@@ -64,16 +79,28 @@ class Ant(abc.ABC):
             files=files,
             json=json,
         )
-        request = await self._pipe(request, self.request_pipelines)
-        self.reporter.report(request)
+        fingerprint = (
+            request_fingerprint(request) if self.state_storage is not None else None
+        )
+        try:
+            request = await self._pipe(request, self.request_pipelines)
+            self.reporter.report(request)
 
-        response = await utils.retry(settings.HTTP_RETRIES, settings.HTTP_RETRY_DELAY)(
-            self.client.send
-        )(request, auth=auth, stream=stream)
+            response = await utils.retry(
+                settings.HTTP_RETRIES, settings.HTTP_RETRY_DELAY
+            )(self.client.send)(request, auth=auth, stream=stream)
 
-        response = await self._pipe(response, self.response_pipelines)
-        self.reporter.report(response)
+            response = await self._pipe(response, self.response_pipelines)
+            self.reporter.report(response)
+        except Exception:
+            # A request is only "done" after its response pipelines succeed,
+            # so failures stay retryable on this and the next resume run.
+            if self.state_storage is not None and fingerprint is not None:
+                self.state_storage.discard_pending_request(fingerprint)
+            raise
 
+        if self.state_storage is not None and fingerprint is not None:
+            await self.state_storage.mark_request_done(fingerprint)
         return response
 
     async def collect(self, item: Item):
@@ -83,6 +110,8 @@ class Ant(abc.ABC):
 
     async def open(self):
         self.logger.info("Opening")
+        if self.state_storage is not None:
+            await self.state_storage.open()
         for pipeline in itertools.chain(
             self.item_pipelines, self.response_pipelines, self.request_pipelines
         ):
@@ -99,6 +128,9 @@ class Ant(abc.ABC):
         await self.client.aclose()
 
         self.reporter.close()
+
+        if self.state_storage is not None:
+            await self.state_storage.close()
 
         self.logger.info("Closed")
 

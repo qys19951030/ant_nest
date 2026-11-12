@@ -36,6 +36,21 @@ HTTP_RETRIES = 0
 HTTP_RETRY_DELAY = 0.1
 
 
+# Persistent state for crash recovery (disabled by default).
+# - enabled: switch the stateful pipelines on/off
+# - dir: directory holding state.db, state.db.bak and the items/ json-lines
+#   output files; deleting it or calling StateStorage.reset() starts clean
+# - mode: "resume" restores the last good checkpoint, "full" wipes all
+#   historical fingerprints, items and checkpoints before crawling
+# - checkpoint_interval: durable writes between two full checkpoint backups
+PERSISTENT_STATE = {
+    "enabled": False,
+    "dir": os.path.join(os.getcwd(), ".ant_nest_state"),
+    "mode": "resume",
+    "checkpoint_interval": 100,
+}
+
+
 if ANT_ENV in ("development", "testing"):
     logging.basicConfig(level=logging.DEBUG)
     asyncio.get_event_loop().set_debug(True)

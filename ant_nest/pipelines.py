@@ -5,12 +5,14 @@ import ujson
 import os
 import random
 import re
+import hashlib
 
 import aiofiles
 from httpx import Request, Response
 
 from .items import Item, set_value, get_value
 from .exceptions import Dropped
+from .states import StateStorage, request_fingerprint
 from .utils import run_cor_func
 
 
@@ -54,6 +56,42 @@ class RequestDuplicateFilterPipeline(Pipeline):
         else:
             self.__request_urls.add(obj.url)
             return obj
+
+
+class PersistentRequestDuplicateFilterPipeline(Pipeline):
+    """Request duplicate filter backed by a persistent :class:`StateStorage`.
+
+    A request fingerprint is the sha256 hash of the upper case HTTP method and
+    the canonical URL (query parameters are sorted, repeated keys are kept;
+    body and headers are ignored). Only requests whose response pipelines
+    finish successfully are persisted as done, so a crash before that point
+    makes the request eligible again on the next resume.
+
+    The bound storage is created by :class:`~ant_nest.ant.Ant` according to
+    settings; using this pipeline without a storage raises on spider open.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.storage: typing.Optional[StateStorage] = None
+
+    def bind_storage(self, storage: StateStorage):
+        self.storage = storage
+
+    def on_spider_open(self):
+        if self.storage is None:
+            raise RuntimeError(
+                "PersistentRequestDuplicateFilterPipeline requires a "
+                "persistent StateStorage; enable PERSISTENT_STATE in settings"
+            )
+
+    def process(self, obj: Request) -> Request:
+        assert self.storage is not None
+        fingerprint = request_fingerprint(obj)
+        if self.storage.is_request_known(fingerprint):
+            raise Dropped("Request duplicate!")
+        self.storage.add_pending_request(fingerprint)
+        return obj
 
 
 class RequestUserAgentPipeline(Pipeline):
@@ -269,6 +307,131 @@ class ItemJsonDumpPipeline(ItemBaseFileDumpPipeline):
         for file_name, data in self.data.items():
             data = ujson.dumps(data)
             await self.dump(os.path.join(self.file_dir, file_name + ".json"), data)
+
+
+class PersistentItemJsonDumpPipeline(ItemBaseFileDumpPipeline):
+    """Append each item to a durable json-lines file while crawling.
+
+    Unlike :class:`ItemJsonDumpPipeline`, items are written and fsync-ed in
+    :meth:`process` instead of being buffered until the spider closes, so
+    every committed item survives a process kill. Each output line is a json
+    object with an ``id`` (the idempotency key) and a ``data`` payload built
+    by ``to_dict``, keeping the same ``to_dict``/``file_dir`` parameters as
+    :class:`ItemJsonDumpPipeline`.
+
+    On open, the previous output file is repaired line by line: complete
+    lines are re-registered as committed item keys and any torn final line is
+    truncated, which makes the file always readable after a crash and keeps a
+    logical item committed at most once across runs.
+    """
+
+    def __init__(
+        self,
+        *,
+        to_dict: typing.Callable[[Item], typing.Dict],
+        file_dir: str = ".",
+        idempotency_key: typing.Optional[typing.Callable[[Item], str]] = None,
+    ):
+        super().__init__()
+        self.file_dir = file_dir
+        self.to_dict = to_dict
+        self.idempotency_key = idempotency_key or self._default_idempotency_key
+        self.storage: typing.Optional[StateStorage] = None
+        self._files: typing.Dict[str, typing.Any] = {}
+
+    def bind_storage(self, storage: StateStorage):
+        self.storage = storage
+
+    @staticmethod
+    def _default_idempotency_key(item: Item) -> str:
+        """Key derived from the canonical json representation of the item.
+
+        Two equal items therefore share a key even across processes; supply a
+        custom callable when the item carries a natural unique identifier.
+        """
+        payload = item if isinstance(item, typing.Dict) else item.__dict__
+        raw = ujson.dumps(payload, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _file_path(self, namespace: str) -> str:
+        return os.path.join(self.file_dir, namespace + ".jsonl")
+
+    async def on_spider_open(self):
+        if self.storage is None:
+            raise RuntimeError(
+                "PersistentItemJsonDumpPipeline requires a persistent "
+                "StateStorage; enable PERSISTENT_STATE in settings"
+            )
+        os.makedirs(self.file_dir, exist_ok=True)
+
+    @staticmethod
+    async def _repair_output_file(file_path: str) -> typing.List[str]:
+        """Drop a torn final line and return ids of all intact lines.
+
+        Each line is decoded independently; everything from the first bad
+        line (typically the half written last line after a kill) is removed
+        by truncating the file at the end of the last good line.
+        """
+        if not os.path.exists(file_path):
+            return []
+        async with aiofiles.open(file_path, "r", encoding="utf-8") as file:
+            content = await file.read()
+
+        good_ids: typing.List[str] = []
+        good_offset = 0
+        offset = 0
+        for line in content.splitlines(keepends=True):
+            try:
+                record = ujson.loads(line)
+                good_ids.append(record["id"])
+            except (ValueError, KeyError, TypeError):
+                break
+            offset += len(line.encode("utf-8"))
+            good_offset = offset
+
+        if good_offset < len(content.encode("utf-8")):
+            async with aiofiles.open(file_path, "r+b") as file:
+                await file.truncate(good_offset)
+                await file.flush()
+                os.fsync(file.fileno())
+        return good_ids
+
+    async def _ensure_output(self, namespace: str):
+        assert self.storage is not None
+        if namespace in self._files:
+            return self._files[namespace]
+
+        file_path = self._file_path(namespace)
+        recovered_ids = await self._repair_output_file(file_path)
+        await self.storage.recover_items(namespace, recovered_ids)
+        absolute_path = await self.storage.register_output(file_path, namespace)
+        self._files[namespace] = await aiofiles.open(
+            absolute_path, "a", encoding="utf-8"
+        )
+        return self._files[namespace]
+
+    async def process(self, obj: Item) -> Item:
+        assert self.storage is not None
+        namespace = obj.__class__.__name__
+        key = self.idempotency_key(obj)
+        if self.storage.is_item_committed(key, namespace):
+            raise Dropped("Item duplicate!")
+
+        record = ujson.dumps({"id": key, "data": self.to_dict(obj)})
+        file = await self._ensure_output(namespace)
+        # Append the whole line first, then persist the idempotency key:
+        # a crash between the two steps only leaves a line whose key is
+        # replayed and deduplicated on the next open, never a lost item.
+        await file.write(record + "\n")
+        await file.flush()
+        os.fsync(file.fileno())
+        await self.storage.commit_item(key, namespace)
+        return obj
+
+    async def on_spider_close(self):
+        for namespace, file in list(self._files.items()):
+            await file.close()
+        self._files.clear()
 
 
 __all__ = [var for var in vars().keys() if "Pipeline" in var]

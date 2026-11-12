@@ -184,6 +184,58 @@ Run it! (without debug log)::
     INFO:GithubAnt:Run GithubAnt in 180.234251 seconds
 
 
+Resume after crash
+==================
+
+The stateful pipelines persist request fingerprints and items to disk, so a
+killed process can resume from the last good checkpoint instead of re-crawling
+everything. Enable it in ``settings.py``::
+
+    PERSISTENT_STATE = {
+        "enabled": True,
+        "dir": "./ant_nest_state",
+        "mode": "resume",  # or "full" to wipe history and start clean
+        "checkpoint_interval": 100,
+    }
+
+Then use the persistent pipelines in your ant::
+
+    from ant_nest.pipelines import (
+        PersistentRequestDuplicateFilterPipeline,
+        PersistentItemJsonDumpPipeline,
+    )
+
+    class MyAnt(Ant):
+        request_pipelines = [PersistentRequestDuplicateFilterPipeline()]
+        item_pipelines = [
+            PersistentItemJsonDumpPipeline(
+                to_dict=lambda item: item.__dict__,
+                file_dir="./output",
+                idempotency_key=lambda item: item.unique_id,
+            )
+        ]
+
+Behavior details:
+
+* A request fingerprint is the sha256 of the upper case HTTP method plus the
+  canonical URL; query parameters are sorted (repeated keys are kept), while
+  body and headers are ignored. A request is only marked done after its
+  response pipelines succeed, so failed or interrupted requests are retried.
+* Items are appended to ``.jsonl`` files and fsync-ed on every collect. Each
+  line is ``{"id": <idempotency key>, "data": <to_dict result>}``; a torn
+  final line after a crash is truncated on the next open, and an item is
+  committed at most once.
+* State lives in ``state.db`` (sqlite, WAL mode) plus a ``state.db.bak``
+  checkpoint backup. Corruption is recovered from the backup; when no backup
+  exists, ``StateCorruptedError`` is raised instead of silently starting
+  empty. ``StateStorage.reset(state_dir)`` or ``mode="full"`` clears all
+  fingerprints, items and checkpoints.
+
+The feature is disabled by default; the in-memory
+``RequestDuplicateFilterPipeline`` and ``ItemJsonDumpPipeline`` keep their
+original behavior.
+
+
 About Item
 ==========
 
